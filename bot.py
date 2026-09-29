@@ -77,12 +77,14 @@ if patch_applied:
 else:
     logger.warning("Market order patch failed - orders may be rejected")
 
+from patch_trade_reconciliation import apply_patch as apply_trade_reconciliation_patch
+apply_trade_reconciliation_patch()
+
 
 # =============================================================================
 # CONSTANTS
 # =============================================================================
 QUOTE_STABILITY_REQUIRED = 3      # Need only 3 valid ticks to be stable (faster startup)
-QUOTE_MIN_SPREAD = 0.001          # Both bid AND ask must be at least this
 MARKET_INTERVAL_SECONDS = 900     # 15-minute markets
 
 
@@ -137,7 +139,7 @@ class IntegratedBTCStrategy(Strategy):
     - Correct timing for market switching
     """
 
-    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False):
+    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False, simulation=True):
         super().__init__()
 
         self.bot_start_time = datetime.now(timezone.utc)
@@ -146,7 +148,9 @@ class IntegratedBTCStrategy(Strategy):
         # Nautilus
         self.instrument_id = None
         self.redis_client = redis_client
-        self.current_simulation_mode = False
+        # Seed from startup mode — if Redis is unreachable we must fall back to
+        # what the user asked for, never silently to live trading.
+        self.current_simulation_mode = simulation
 
         # Store ALL BTC instruments
         self.all_btc_instruments: List[Dict] = []
@@ -231,7 +235,17 @@ class IntegratedBTCStrategy(Strategy):
         # Paper trading tracker
         self.paper_trades: List[PaperTrade] = []
 
+        # Pending real orders: client_order_id -> metadata dict
+        self._pending_orders: dict = {}
+
         self.test_mode = test_mode
+        self.simulation = simulation
+        if test_mode:
+            self._trade_log_path = "trade_log_test.csv"
+        elif simulation:
+            self._trade_log_path = "trade_log_simulation.csv"
+        else:
+            self._trade_log_path = "trade_log_live.csv"
 
         if test_mode:
             logger.info("=" * 80)
@@ -257,28 +271,6 @@ class IntegratedBTCStrategy(Strategy):
         next_boundary = (math.floor(now_ts / MARKET_INTERVAL_SECONDS) + 1) * MARKET_INTERVAL_SECONDS
         return next_boundary - now_ts
 
-    def _is_quote_valid(self, bid, ask) -> bool:
-        """Return True only when BOTH bid and ask are present and make sense."""
-        if bid is None or ask is None:
-            return False
-        try:
-            b = float(bid)
-            a = float(ask)
-        except (TypeError, ValueError):
-            return False
-        if b < QUOTE_MIN_SPREAD or a < QUOTE_MIN_SPREAD:
-            return False
-        if b > 0.999 or a > 0.999:
-            return False
-        return True
-
-    def _reset_stability(self, reason: str = ""):
-        """Mark the market as unstable and reset the counter."""
-        if self._market_stable:
-            logger.warning(f"Market stability RESET{' – ' + reason if reason else ''}")
-        self._market_stable = False
-        self._stable_tick_count = 0
-
     # ------------------------------------------------------------------
     # Redis
     # ------------------------------------------------------------------
@@ -291,6 +283,17 @@ class IntegratedBTCStrategy(Strategy):
             sim_mode = self.redis_client.get('btc_trading:simulation_mode')
             if sim_mode is not None:
                 redis_simulation = sim_mode == '1'
+                # Hard floor: a process started in simulation can never flip
+                # to live. The Nautilus node was built with risk_engine
+                # bypass=True for this session; going live mid-run would
+                # trade real money with no risk checks.
+                if not redis_simulation and self.simulation:
+                    logger.warning(
+                        "Redis requested LIVE but this process started in SIMULATION "
+                        "(Nautilus risk engine bypassed) — staying in simulation. "
+                        "Restart with --live to trade real money."
+                    )
+                    return True
                 if redis_simulation != self.current_simulation_mode:
                     self.current_simulation_mode = redis_simulation
                     mode_text = "SIMULATION" if redis_simulation else "LIVE TRADING"
@@ -334,8 +337,10 @@ class IntegratedBTCStrategy(Strategy):
             except Exception as e:
                 logger.debug(f"No initial price yet: {e}")
 
-        # Generate synthetic history if needed
-        if len(self.price_history) < 20:
+        # Generate synthetic history if needed — SIMULATION ONLY.
+        # In live mode we wait for 20 real ticks instead of feeding the
+        # signal processors random prices (ticks arrive within seconds).
+        if self.simulation and len(self.price_history) < 20:
             self._generate_synthetic_history(target_count=20, existing_count=len(self.price_history))
 
         # =========================================================================
@@ -638,7 +643,7 @@ class IntegratedBTCStrategy(Strategy):
             try:
                 bid_decimal = bid.as_decimal()
                 ask_decimal = ask.as_decimal()
-            except:
+            except Exception:
                 return
 
             # Always store price history
@@ -752,21 +757,10 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _make_trading_decision_sync(self, current_price):
-        from decimal import Decimal
-        price_decimal = Decimal(str(current_price))
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._make_trading_decision(price_decimal))
-        finally:
-            loop.close()
-    
-    def _make_trading_decision_sync(self, current_price):
         """Synchronous wrapper for trading decision (called from executor)."""
         # Convert float back to Decimal for processing
-        from decimal import Decimal
         price_decimal = Decimal(str(current_price))
-        
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -1042,6 +1036,21 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
 
         self._save_paper_trades()
+        self._log_trade_to_csv({
+            "timestamp": paper_trade.timestamp.isoformat(),
+            "type": "paper",
+            "order_id": f"paper_{int(paper_trade.timestamp.timestamp())}",
+            "direction": direction.upper(),
+            "instrument_id": str(self.instrument_id) if self.instrument_id else "",
+            "entry_price": float(current_price),
+            "exit_price": float(exit_price),
+            "size_usd": float(position_size),
+            "pnl": float(pnl),
+            "pnl_pct": round(movement * 100, 4),
+            "outcome": outcome,
+            "signal_score": signal.score,
+            "signal_confidence": signal.confidence,
+        })
 
     def _save_paper_trades(self):
         import json
@@ -1051,6 +1060,26 @@ class IntegratedBTCStrategy(Strategy):
                 json.dump(trades_data, f, indent=2)
         except Exception as e:
             logger.error(f"Failed to save paper trades: {e}")
+
+    CSV_COLUMNS = [
+        "timestamp", "type", "order_id", "direction", "instrument_id",
+        "entry_price", "fill_price", "size_usd", "fill_qty",
+        "exit_price", "pnl", "pnl_pct", "outcome",
+        "signal_score", "signal_confidence",
+    ]
+
+    def _log_trade_to_csv(self, row: dict) -> None:
+        import csv, os
+        path = self._trade_log_path
+        write_header = not os.path.exists(path)
+        try:
+            with open(path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self.CSV_COLUMNS, extrasaction="ignore")
+                if write_header:
+                    writer.writeheader()
+                writer.writerow({col: row.get(col, "") for col in self.CSV_COLUMNS})
+        except Exception as e:
+            logger.error(f"Failed to write trade_log.csv: {e}")
 
     # ------------------------------------------------------------------
     # Real order (unchanged)
@@ -1124,6 +1153,15 @@ class IntegratedBTCStrategy(Strategy):
             )
 
             self.submit_order(order)
+            self._pending_orders[unique_id] = {
+                "direction": trade_label,
+                "instrument_id": str(trade_instrument_id),
+                "entry_price": trade_price,
+                "size_usd": max_usd_amount,
+                "signal_score": signal.score if hasattr(signal, 'score') else 0.0,
+                "signal_confidence": signal.confidence if hasattr(signal, 'confidence') else 0.0,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
             logger.info(f"REAL ORDER SUBMITTED!")
             logger.info(f"  Order ID: {unique_id}")
@@ -1221,27 +1259,12 @@ class IntegratedBTCStrategy(Strategy):
 
     def _track_order_event(self, event_type: str) -> None:
         """
-        Safely track an order event on the performance tracker.
-
-        PerformanceTracker does not expose `increment_order_counter`, so we
-        use whichever method is actually available, or fall back to a no-op.
-        Supported event_type values: "placed", "filled", "rejected".
+        Track an order event ("placed", "filled", "rejected") on the
+        Grafana exporter's Prometheus counters.
         """
         try:
-            pt = self.performance_tracker
-            # Try the method that actually exists first
-            if hasattr(pt, 'record_order_event'):
-                pt.record_order_event(event_type)
-            elif hasattr(pt, 'increment_counter'):
-                pt.increment_counter(event_type)
-            elif hasattr(pt, 'increment_order_counter'):
-                pt.increment_order_counter(event_type)
-            else:
-                # No suitable method found – log and carry on
-                logger.debug(
-                    f"PerformanceTracker has no order-counter method; "
-                    f"ignoring event '{event_type}'"
-                )
+            if self.grafana_exporter:
+                self.grafana_exporter.increment_order_counter(event_type)
         except Exception as e:
             logger.warning(f"Failed to track order event '{event_type}': {e}")
 
@@ -1254,6 +1277,22 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
         self._track_order_event("filled")
 
+        order_id = str(event.client_order_id)
+        meta = self._pending_orders.pop(order_id, {})
+        self._log_trade_to_csv({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "type": "real",
+            "order_id": order_id,
+            "direction": meta.get("direction", ""),
+            "instrument_id": meta.get("instrument_id", str(getattr(event, 'instrument_id', ""))),
+            "entry_price": meta.get("entry_price", ""),
+            "fill_price": float(event.last_px),
+            "size_usd": meta.get("size_usd", ""),
+            "fill_qty": float(event.last_qty),
+            "signal_score": meta.get("signal_score", ""),
+            "signal_confidence": meta.get("signal_confidence", ""),
+        })
+
     def on_order_denied(self, event):
         logger.error("=" * 80)
         logger.error(f"ORDER DENIED!")
@@ -1261,9 +1300,12 @@ class IntegratedBTCStrategy(Strategy):
         logger.error(f"  Reason: {event.reason}")
         logger.error("=" * 80)
         self._track_order_event("rejected")
+        self._pending_orders.pop(str(event.client_order_id), None)
 
     def on_order_rejected(self, event):
         """Handle order rejection — reset trade timer so we can retry next tick."""
+        self._pending_orders.pop(str(getattr(event, 'client_order_id', '')), None)
+        self._track_order_event("rejected")
         reason = str(getattr(event, 'reason', ''))
         reason_lower = reason.lower()
         if 'no orders found' in reason_lower or 'fak' in reason_lower or 'no match' in reason_lower:
@@ -1280,12 +1322,15 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _start_grafana_sync(self):
-        import asyncio
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(self.grafana_exporter.start())
             logger.info("Grafana metrics started on port 8000")
+            # start() schedules the metrics update loop as a task on this
+            # event loop — keep the loop alive or metrics never refresh.
+            # Daemon thread, so this doesn't block shutdown.
+            loop.run_forever()
         except Exception as e:
             logger.error(f"Failed to start Grafana: {e}")
 
@@ -1404,6 +1449,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         redis_client=redis_client,
         enable_grafana=enable_grafana,
         test_mode=test_mode,
+        simulation=simulation,
     )
 
     print("\nBuilding Nautilus node...")

@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from execution.risk_engine import get_risk_engine, RiskEngine
 from core.strategy_brain.signal_processors.base_processor import SignalDirection
+from monitoring.performance_tracker import get_performance_tracker
 
 
 class OrderType(Enum):
@@ -131,6 +132,7 @@ class ExecutionEngine:
         current_price: Decimal,
         stop_loss: Optional[Decimal] = None,
         take_profit: Optional[Decimal] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[Order]:
         """
         Execute trading signal.
@@ -187,16 +189,18 @@ class ExecutionEngine:
             return None
         
         # Create order
+        order_metadata = {
+            "signal_direction": signal_direction.value,
+            "signal_confidence": signal_confidence,
+            "signal_score": signal_score,
+            **(metadata or {}),
+        }
         order = await self.place_market_order(
             side=side,
             size=position_size,
             stop_loss=stop_loss,
             take_profit=take_profit,
-            metadata={
-                "signal_direction": signal_direction.value,
-                "signal_confidence": signal_confidence,
-                "signal_score": signal_score,
-            }
+            metadata=order_metadata,
         )
         
         if order:
@@ -422,7 +426,22 @@ class ExecutionEngine:
         
         # Calculate P&L
         pnl = self.risk_engine.remove_position(position_id, exit_price)
-        
+
+        # Record trade in performance tracker so learning engine can use it
+        tracker = get_performance_tracker()
+        tracker.record_trade(
+            trade_id=position_id,
+            direction=position["direction"],
+            entry_price=position["entry_price"],
+            exit_price=exit_price,
+            size=position["size"],
+            entry_time=position["entry_time"],
+            exit_time=datetime.now(),
+            signal_score=position["metadata"].get("signal_score", 0.0),
+            signal_confidence=position["metadata"].get("signal_confidence", 0.0),
+            metadata={**position["metadata"], "close_reason": reason},
+        )
+
         # Update position
         position["status"] = "closed"
         position["exit_price"] = exit_price

@@ -5,6 +5,7 @@ Combines multiple signals with weighted voting
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass
+from collections import deque
 from loguru import logger
 
 import os 
@@ -45,14 +46,16 @@ class FusedSignal:
 class SignalFusionEngine:
     def __init__(self):
         self.weights = {
-            "SpikeDetection":    0.40,
-            "PriceDivergence":   0.30,
-            "SentimentAnalysis": 0.20,
-            "default":           0.10,
+            "SpikeDetection":     0.35,
+            "TickVelocity":       0.30,
+            "OrderBookImbalance": 0.25,
+            "PriceDivergence":    0.25,
+            "SentimentAnalysis":  0.15,
+            "DeribitPCR":         0.15,
+            "default":            0.10,
         }
-        
-        self._signal_history: List[FusedSignal] = []
-        self._max_history = 100
+
+        self._signal_history: deque = deque(maxlen=100)
         self._fusions_performed = 0
         
         logger.info("Initialized Signal Fusion Engine")
@@ -127,10 +130,10 @@ class SignalFusionEngine:
             return None
         
         if bullish_contrib >= bearish_contrib:
-            direction = SignalDirection.BULLISH if "BULLISH" in str(SignalDirection.BULLISH) else "BULLISH"
+            direction = SignalDirection.BULLISH
             dominant = bullish_contrib
         else:
-            direction = SignalDirection.BEARISH if "BEARISH" in str(SignalDirection.BEARISH) else "BEARISH"
+            direction = SignalDirection.BEARISH
             dominant = bearish_contrib
         
         consensus_score = (dominant / total_contrib) * 100 if total_contrib > 0 else 0.0
@@ -159,8 +162,6 @@ class SignalFusionEngine:
         
         self._fusions_performed += 1
         self._signal_history.append(fused)
-        if len(self._signal_history) > self._max_history:
-            self._signal_history.pop(0)
         
         logger.info(
             f"Fused {len(recent_signals)} signals → {direction} "
@@ -170,7 +171,8 @@ class SignalFusionEngine:
         return fused
     
     def get_recent_fusions(self, limit: int = 10) -> List[FusedSignal]:
-        return self._signal_history[-limit:]
+        # deque doesn't support slicing — convert first
+        return list(self._signal_history)[-limit:]
     
     def get_statistics(self) -> Dict[str, Any]:
         if not self._signal_history:
@@ -181,7 +183,7 @@ class SignalFusionEngine:
                 "avg_confidence": 0.0,
             }
         
-        recent = self._signal_history[-20:]
+        recent = list(self._signal_history)[-20:]
         return {
             "total_fusions": self._fusions_performed,
             "recent_fusions": len(recent),
